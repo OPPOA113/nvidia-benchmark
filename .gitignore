@@ -1,0 +1,6 @@
+
+*.wts
+*.engine
+.vscode
+build*
+output
