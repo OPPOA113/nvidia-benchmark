@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, as_compl
 CONF_THRESH = 0.5
 IOU_THRESHOLD = 0.4
 # global isSaveImage
-isSaveImage=False
+isSaveImage=True
 
 def get_img_path_batches(batch_size, img_dir):
     ret = []
@@ -564,7 +564,7 @@ class inferThread_2(threading.Thread):
                 save_name = os.path.join(self.yolov5_wrapper.save_path, filename)
                 # Save image
                 cv2.imwrite(save_name, batch_image_raw[0])
-                print('input->{}, time->{:.2f}ms, saving into {}/'.format(self.image_path_batch, use_time * 1000, save_name)) 
+                print('input->{}, time->{:.2f}ms, saving into {}/'.format(image_path, use_time * 1000, save_name)) 
 
 
 class warmUpThread(threading.Thread):
@@ -641,6 +641,7 @@ def get_img_path_by_processor_number(nProcessor, batch_size, img_dir):
     ret = []
     batch = []
     for root, dirs, files in os.walk(img_dir):
+        files=files[0:2000]
         need_files_num = len(files) // (nProcessor * batch_size) * (nProcessor * batch_size)
         num_per_prossor = need_files_num // nProcessor
         print(f">>>>>>>>>>>>>>>>>> acctualy need {need_files_num} files")
