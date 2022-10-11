@@ -3,4 +3,4 @@
 *.engine
 .vscode
 build*
-output
+output*

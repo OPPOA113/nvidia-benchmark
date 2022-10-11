@@ -796,13 +796,13 @@ def process_mutil_loaddata(pool_index,yolov5_wrapper, data_path_list, data_batch
         yolov5_wrapper.destroy()
 
 
-def Processor_func(data_path_list, thread_nums, pool_index, num_load=4,
-                    input_w=640,input_h=640):
+def Processor_func(data_path_list, thread_nums, pool_index, num_load=4):
     """
         进程函数
     """
-    def productor_loaddata_to_queue(pool_index, thread_id, data_list):
-        print(f"thread_id:{thread_id}, data_list type:{type(data_list)},len={len(data_list)}")
+    def productor_loaddata_to_queue(pool_index, thread_id, data_list,
+                    input_w=640,input_h=640):
+        print(f"pool_index:{pool_index},thread_id:{thread_id}, data_list type:{type(data_list)},len={len(data_list)}")
         for index in range(len(data_list)):
             image_path = data_list[index]
             # print(f"productor: {image_path}")
@@ -879,6 +879,8 @@ def Processor_func(data_path_list, thread_nums, pool_index, num_load=4,
     print(f"make output dir {save_path}")
     # a YoLov5TRT instance
     yolov5_wrapper = YoLov5TRT(engine_file_path, save_path)
+    input_w = yolov5_wrapper.input_w
+    input_h = yolov5_wrapper.input_h
 
     # # *************************************************
     # # 两种多进程方式：1
@@ -896,7 +898,7 @@ def Processor_func(data_path_list, thread_nums, pool_index, num_load=4,
     thread_id = 0
     for batch_i in range(0, len(data_path_list), num_per_thread):
         data_list = data_path_list[batch_i: batch_i+num_per_thread]
-        t = threading.Thread(target=productor_loaddata_to_queue, args=(pool_index, thread_id, data_list,))
+        t = threading.Thread(target=productor_loaddata_to_queue, args=(pool_index, thread_id, data_list,input_w,input_h,))
         thread_id+=1
         t_list.append(t)
         t.start()
@@ -918,7 +920,7 @@ def multiProcessor_and_multiThread():
     """
     
     thread_num = 4              # 线程最大数量  {dataloader 多线程取数据有问题！！}
-    pool_num = 4                # 进程数量
+    pool_num = 2                # 进程数量
     number_load_by_mutilT = 4   # 多线程取数据数
     pool_count = 0
 
