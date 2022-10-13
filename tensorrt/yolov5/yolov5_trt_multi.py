@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED, as_compl
 CONF_THRESH = 0.5
 IOU_THRESHOLD = 0.4
 # global isSaveImage
-isSaveImage=True
+isSaveImage=False
 
 def get_img_path_batches(batch_size, img_dir):
     ret = []
@@ -291,6 +291,67 @@ class YoLov5TRT(object):
             batch_origin_h.append(origin_h)
             batch_origin_w.append(origin_w)
             np.copyto(batch_input_image[i], input_image)
+        batch_input_image = np.ascontiguousarray(batch_input_image)
+
+        # Copy input image to host buffer batch数据copy到GPU
+        np.copyto(host_inputs[0], batch_input_image.ravel())
+        start = time.time()
+        # Transfer input data  to the GPU.
+        cuda.memcpy_htod_async(cuda_inputs[0], host_inputs[0], stream)
+        # Run inference.
+        context.execute_async(batch_size=self.batch_size, bindings=bindings, stream_handle=stream.handle)
+        # Transfer predictions back from the GPU.
+        cuda.memcpy_dtoh_async(host_outputs[0], cuda_outputs[0], stream)
+        # Synchronize the stream
+        stream.synchronize()
+        end = time.time()
+        # Remove any context from the top of the context stack, deactivating it.
+        self.ctx.pop()
+        # Here we use the first row of output in that batch_size = 1
+        output = host_outputs[0]
+        # Do postprocess
+        for i in range(self.batch_size):
+            result_boxes, result_scores, result_classid = self.post_process(
+                output[i * 6001: (i + 1) * 6001], batch_origin_h[i], batch_origin_w[i]
+            )
+            if isSaveImage:
+                # Draw rectangles and labels on the original image # 测试时间，不画图
+                for j in range(len(result_boxes)):
+                    box = result_boxes[j]
+                    plot_one_box(
+                        box,
+                        batch_image_raw[i],
+                        label="{}:{:.2f}".format(
+                            categories[int(result_classid[j])], result_scores[j]
+                        ),
+                    )
+        return batch_image_raw, end - start
+    
+    def infer_batch(self, input_image, image_raw, origin_w, origin_h):
+        threading.Thread.__init__(self)
+        # Make self the active context, pushing it on top of the context stack.
+        self.ctx.push()
+        # Restore
+        stream = self.stream
+        context = self.context
+        engine = self.engine
+        host_inputs = self.host_inputs
+        cuda_inputs = self.cuda_inputs
+        host_outputs = self.host_outputs
+        cuda_outputs = self.cuda_outputs
+        bindings = self.bindings
+        # Do image preprocess 组装batch数据
+        batch_image_raw = []
+        batch_origin_h = []
+        batch_origin_w = []
+        batch_input_image = np.empty(shape=[self.batch_size, 3, self.input_h, self.input_w])
+        
+        for i in range(self.batch_size):
+            # input_image, image_raw, origin_h, origin_w = self.preprocess_image(image_raw)
+            batch_image_raw.append(image_raw[i])
+            batch_origin_h.append(origin_h[i])
+            batch_origin_w.append(origin_w[i])
+            np.copyto(batch_input_image[i], input_image[i])
         batch_input_image = np.ascontiguousarray(batch_input_image)
 
         # Copy input image to host buffer batch数据copy到GPU
@@ -641,7 +702,7 @@ def get_img_path_by_processor_number(nProcessor, batch_size, img_dir):
     ret = []
     batch = []
     for root, dirs, files in os.walk(img_dir):
-        files=files[0:2000]
+        # files=files[0:2000]
         need_files_num = len(files) // (nProcessor * batch_size) * (nProcessor * batch_size)
         num_per_prossor = need_files_num // nProcessor
         print(f">>>>>>>>>>>>>>>>>> acctualy need {need_files_num} files")
@@ -858,7 +919,6 @@ def Processor_func(data_path_list, thread_nums, pool_index, num_load=4):
     # load custom plugin and engine
     PLUGIN_LIBRARY = "build/libmyplugins.so"
     engine_file_path = "build/yolov5s.engine"
-
     ctypes.CDLL(PLUGIN_LIBRARY)
 
     # load coco labels
@@ -892,6 +952,7 @@ def Processor_func(data_path_list, thread_nums, pool_index, num_load=4):
     # 方式3 生产者消费者模式： 队列 + 多线程取数据 + 单线程处理
     global queue_data
     queue_data = queue.Queue(128)
+    # queue_data = Queue(128)
     # productor
     start_ = time.time()
     t_list=[]
@@ -917,7 +978,7 @@ def Processor_func(data_path_list, thread_nums, pool_index, num_load=4):
 
 def multiProcessor_and_multiThread():
     """
-        多进程套多线程
+        多进程套多线程: 多线程load数据,单个tensorrt处理核
     """
     
     thread_num = 4              # 线程最大数量  {dataloader 多线程取数据有问题！！}
@@ -930,7 +991,6 @@ def multiProcessor_and_multiThread():
     image_path_batches = get_img_path_by_processor_number(pool_num, number_load_by_mutilT, image_dir)   # 确保每个进程的处理数量一致，且能被number_load_by_mutilT整除
     print("number batch data:", len(image_path_batches))
 
-
     p_list = []
     for data_list in image_path_batches:
         proc = multiprocessing.Process(target=Processor_func, args=(data_list, thread_num, pool_count, number_load_by_mutilT))
@@ -942,10 +1002,198 @@ def multiProcessor_and_multiThread():
         res.join()
 
 
+class tensorrt_core_thread(threading.Thread):
+    def __init__(self, core_index, engine_file_path,output_save_path, data_queue):
+        threading.Thread.__init__(self)
+        self.core_index = core_index
+        self.data_queue = data_queue
+
+        self.yolov5_wrapper = YoLov5TRT(engine_file_path, output_save_path)
+        self.input_w = self.yolov5_wrapper.input_w
+        self.input_h = self.yolov5_wrapper.input_h
+        self.batch_size = self.yolov5_wrapper.batch_size
+        print(f"init tensorrt core done, core_index:{core_index} ")
+
+    def release(self):
+        self.yolov5_wrapper.destroy()
+
+    def run(self):
+        print(f"in infer thread,qsize={self.data_queue.qsize()}")
+        while True:
+            if self.data_queue.empty():
+                print(f"data_queue empty, watiting.....")
+                time.sleep(200/1000)
+                if self.data_queue.empty():
+                    break
+                continue
+            data_node = self.data_queue.get()
+            image_batch = data_node['image']
+            image_path_batch = data_node['image_path']
+            image_raw_batch = data_node['image_raw']
+            ori_w_batch = data_node['w']
+            ori_h_batch = data_node['h']
+            batch_image_raw, use_time = self.yolov5_wrapper.infer_batch(image_batch, image_raw_batch, ori_w_batch, ori_h_batch)
+            if isSaveImage:
+                for b in range(self.batch_size):
+                    ori_path = image_path_batch[b]
+                    parent, filename = os.path.split(ori_path)
+                    save_name = os.path.join(self.yolov5_wrapper.save_path, filename)
+                    # Save image
+                    cv2.imwrite(save_name, batch_image_raw[b])
+                    print('input->{}, time->{:.2f}ms, saving into {}/'.format(ori_path, use_time * 1000, save_name)) 
+
+
+
+def singleProcessor_multiThread():
+    """单个进程,多个tensorrt处理核,多个线程load数据"""
+    input_batch_size = 8
+    threads_per_core = 8
+    number_tensorrt_core = 1
+
+    # load coco labels
+    global categories
+    categories = ["person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+        "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+        "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+        "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+        "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+        "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+        "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+        "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+        "hair drier", "toothbrush"]
+    
+    def load_batchdata_to_queue(queue_data, batch_size, thread_id, data_list,
+                input_w=640,input_h=640):
+        print(f"process core thread_id:{thread_id}, data_list type:{type(data_list)},len={len(data_list)}")
+        
+        input_batch_images=[]
+        input_batch_raw_images=[]
+        input_batch_path=[]
+        input_batch_w=[]
+        input_batch_h=[]
+        for index in range(len(data_list)):
+            image_path = data_list[index]
+            # print(f"core thread_id:{thread_id} ,productor: {image_path}")
+            image_raw = cv2.imread(image_path)
+            h, w, c = image_raw.shape
+            image = cv2.cvtColor(image_raw, cv2.COLOR_BGR2RGB)
+            # Calculate widht and height and paddings
+            r_w = input_w / w
+            r_h = input_h / h
+            if r_h > r_w:
+                tw = input_w
+                th = int(r_w * h)
+                tx1 = tx2 = 0
+                ty1 = int((input_h - th) / 2)
+                ty2 = input_h - th - ty1
+            else:
+                tw = int(r_h * w)
+                th = input_h
+                tx1 = int((input_w - tw) / 2)
+                tx2 = input_w - tw - tx1
+                ty1 = ty2 = 0
+            # Resize the image with long side while maintaining ratio
+            image = cv2.resize(image, (tw, th))
+            # Pad the short side with (128,128,128)
+            image = cv2.copyMakeBorder(
+                image, ty1, ty2, tx1, tx2, cv2.BORDER_CONSTANT, None, (128, 128, 128)
+            )
+            image = image.astype(np.float32)
+            # Normalize to [0,1]
+            image /= 255.0
+            # HWC to CHW format:
+            image = np.transpose(image, [2, 0, 1])
+            # CHW to NCHW format
+            # image = np.expand_dims(image, axis=0)
+            # Convert the image to row-major order, also known as "C order":
+            image = np.ascontiguousarray(image)
+            
+            input_batch_images.append(image)
+            input_batch_raw_images.append(image_raw)
+            input_batch_path.append(image_path)
+            input_batch_w.append(w)
+            input_batch_h.append(h)
+
+            if len(input_batch_images) == batch_size:
+                dat_node = dict()
+                dat_node["image"]=input_batch_images
+                dat_node["image_path"]=input_batch_path
+                dat_node["image_raw"]=input_batch_raw_images
+                dat_node["w"]=input_batch_w
+                dat_node["h"]=input_batch_h
+                queue_data.put(dat_node)
+                input_batch_images=[]
+                input_batch_path=[]
+                input_batch_raw_images=[]
+                input_batch_w=[]
+                input_batch_h=[]
+            
+    # 5000张
+    image_dir = "/workspace/project/dataset/benchmarch_data/detection/val2017"
+    image_path_batches = get_img_path_by_processor_number(number_tensorrt_core, input_batch_size, image_dir)   # 确保每个进程的处理数量一致，且能被number_load_by_mutilT整除
+    print("number of images per core:", len(image_path_batches[0])*number_tensorrt_core)
+
+    # load custom plugin and engine
+    PLUGIN_LIBRARY = "build/libmyplugins.so"
+    engine_file_path = "build/yolov5s.engine"
+    ctypes.CDLL(PLUGIN_LIBRARY)
+
+    save_paths = []
+    data_queue=[]
+    for i in range(number_tensorrt_core):
+        save_path = 'output_'+ str(i) +'/'
+        if os.path.exists(save_path):
+            shutil.rmtree(save_path)
+        os.makedirs(save_path)
+        print(f"make output dir {save_path}")
+        save_paths.append(save_path)
+        data_queue.append(queue.Queue(128))
+
+    core_threads=[]
+    t_data_list=[]
+    for c in range(number_tensorrt_core):
+        # # a YoLov5TRT instance
+        core_thread = tensorrt_core_thread(c, engine_file_path,save_paths[c],data_queue[c],)
+        assert core_thread.batch_size == input_batch_size
+        input_w = core_thread.input_w
+        input_h = core_thread.input_h
+        core_threads.append(core_thread)
+
+        num_per_thread = len(image_path_batches[c]) // threads_per_core
+        thread_id = 0
+        for batch_i in range(0, len(image_path_batches[c]), num_per_thread):
+            data_list = image_path_batches[c][batch_i: batch_i+num_per_thread]
+            t = threading.Thread(target=load_batchdata_to_queue, args=(data_queue[c], core_thread.batch_size, thread_id, data_list,input_w,input_h,))
+            thread_id+=1
+            t_data_list.append(t)
+            # t.start()
+    
+    start_ = time.time()
+    # start
+    for d_thread in  t_data_list:
+        d_thread.start()  
+    for c_thread in core_threads:
+        c_thread.start()
+    # join
+    for c_thread in core_threads:
+        c_thread.join()
+        c_thread.release()
+    for d_thread in  t_data_list:
+        d_thread.join() 
+
+    end_ = time.time()
+    print(f'done. {number_tensorrt_core} tensorrt core, {threads_per_core} threads per core, \
+        batch size:{input_batch_size},input_w_h:{input_w}x{input_h} \
+        process total {len(image_path_batches[0])*number_tensorrt_core} images, \
+        eclapse time:{(end_-start_)*1000:.2f}ms, saving images status {isSaveImage}') 
+
+    
+
 if __name__ == "__main__":
     # yolov5_demo()
     multiprocessing.set_start_method('spawn')
-    multiProcessor_and_multiThread()
+    # multiProcessor_and_multiThread()
+    singleProcessor_multiThread()
     
 
     
